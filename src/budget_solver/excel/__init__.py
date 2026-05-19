@@ -15,7 +15,15 @@ from budget_solver.constants import NAV, BLUE, GRN, RED, LGRY, LBLU, WHIT
 from budget_solver.excel.styling import _hdr, _fmt_col, _border, sanitize_display_currency
 from budget_solver.narrative import full_scenario_narrative
 from budget_solver.excel.builders import _build_overview, _build_scenario_sheet
-from budget_solver.excel.phase6b import _build_extended_budget, _build_curve_diagnostics, _build_outlier_log, _build_demand_index
+from budget_solver.excel.phase6b import (
+    _build_extended_budget,
+    _build_curve_diagnostics,
+    _build_outlier_log,
+    _build_demand_index,
+    _build_confidence_intervals,
+    _build_cpc_diagnostics,
+    _build_impression_share_diagnostics,
+)
 
 
 def build_excel(
@@ -32,6 +40,9 @@ def build_excel(
     actual_window_label: str = 'Last 30 days',
     actual_window_detail: str = None,
     extended_budget_steps: int = 6,
+    confidence_payload: dict = None,
+    calibration_factors: dict = None,
+    training_months: int = None,
 ):
     """
     Build multi-scenario Excel report.
@@ -75,7 +86,10 @@ def build_excel(
     if scen_d:
         _build_scenario_sheet(wb, scen_d, scen_c, min_mroas, "D")
     _build_extended_budget(wb, scenario_set, extended_budget_steps)
-    _build_curve_diagnostics(wb, scenario_set, model_info, account_data)
+    _build_confidence_intervals(wb, confidence_payload, min_mroas)
+    _build_cpc_diagnostics(wb, df)
+    _build_impression_share_diagnostics(wb, df)
+    _build_curve_diagnostics(wb, scenario_set, model_info, account_data, calibration_factors, training_months)
     _build_outlier_log(wb, removal_log if removal_log else [])
     _build_demand_index(wb, demand_index if demand_index else {}, demand_normalized, forecast_week if forecast_week else 1, forecast_label)
 

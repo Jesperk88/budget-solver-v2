@@ -165,7 +165,10 @@ def build_query(start_date: str, end_date: str) -> str:
             metrics.conversions,
             metrics.conversions_value,
             metrics.clicks,
-            metrics.impressions
+            metrics.impressions,
+            metrics.search_impression_share,
+            metrics.search_budget_lost_impression_share,
+            metrics.search_rank_lost_impression_share
         FROM campaign
         WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
           AND campaign.advertising_channel_type = 'SEARCH'
@@ -238,6 +241,9 @@ def pull_account_data(
                 "conversion_value":  row.metrics.conversions_value,
                 "clicks":            row.metrics.clicks,
                 "impressions":       row.metrics.impressions,
+                "search_impression_share": row.metrics.search_impression_share,
+                "search_budget_lost_impression_share": row.metrics.search_budget_lost_impression_share,
+                "search_rank_lost_impression_share": row.metrics.search_rank_lost_impression_share,
                 "currency":          row.customer.currency_code,
             })
     except GoogleAdsException as ex:
@@ -304,6 +310,29 @@ def main():
 
     # Build DataFrame
     df = pd.DataFrame(all_rows)
+    for col in [
+        "search_impression_share",
+        "search_budget_lost_impression_share",
+        "search_rank_lost_impression_share",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    valid_search_is = (
+        df["search_impression_share"].notna()
+        & (df["search_impression_share"] > 0)
+        & (df["impressions"] > 0)
+    )
+    df["eligible_search_impressions"] = np.where(
+        valid_search_is,
+        df["impressions"] / df["search_impression_share"],
+        np.nan,
+    )
+    df["search_budget_lost_impressions"] = (
+        df["search_budget_lost_impression_share"] * df["eligible_search_impressions"]
+    )
+    df["search_rank_lost_impressions"] = (
+        df["search_rank_lost_impression_share"] * df["eligible_search_impressions"]
+    )
 
     # Aggregate campaign-level rows → account + date level
     # (multiple campaigns per account per day collapse into one row)
@@ -315,9 +344,27 @@ def main():
             conversion_value=("conversion_value", "sum"),
             clicks=("clicks", "sum"),
             impressions=("impressions", "sum"),
+            eligible_search_impressions=("eligible_search_impressions", "sum"),
+            search_budget_lost_impressions=("search_budget_lost_impressions", "sum"),
+            search_rank_lost_impressions=("search_rank_lost_impressions", "sum"),
         )
         .reset_index()
         .sort_values(["account_name", "date"])
+    )
+
+    eligible = df_daily["eligible_search_impressions"].where(
+        df_daily["eligible_search_impressions"] > 0
+    )
+    df_daily["search_impression_share"] = df_daily["impressions"] / eligible
+    df_daily["search_budget_lost_impression_share"] = (
+        df_daily["search_budget_lost_impressions"] / eligible
+    )
+    df_daily["search_rank_lost_impression_share"] = (
+        df_daily["search_rank_lost_impressions"] / eligible
+    )
+    df_daily.drop(
+        columns=["search_budget_lost_impressions", "search_rank_lost_impressions"],
+        inplace=True,
     )
 
     # Remove any residual zero-spend rows post-aggregation
@@ -384,6 +431,7 @@ def main():
     print(f"Saved to   : {Path(OUTPUT_CSV).resolve()}")
     print()
     print("Lag correction applied. 'conversion_value_adj' is the column used by optimizer")
+    print("Impression share diagnostics fields included for Search budget/rank constraints")
     print("Next step  : budget-solver --budget <amount> --data output/core_markets.csv --scenarios")
 
 

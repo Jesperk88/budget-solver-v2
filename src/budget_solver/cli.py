@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from budget_solver.constants import TRAILING_WINDOW_DAYS, WEEKS_PER_MONTH, DATA_PATH
+from budget_solver.constants import WEEKS_PER_MONTH, DATA_PATH
 from budget_solver.data import (
     load_data,
     aggregate_weekly,
@@ -27,6 +27,164 @@ from budget_solver.excel import build_excel
 from budget_solver.utils import parse_kv_arg, resolve_forecast_period
 from budget_solver.scenarios import scenario_a, scenario_b, scenario_c, scenario_d, build_scenarios
 from budget_solver.narrative import full_scenario_narrative
+from budget_solver.confidence import run_bootstrap
+
+
+def _scaled_params(params, model_name: str, scale: float) -> list[float]:
+    """Scale fitted parameters so calibrated mROAS/breakeven math matches revenue."""
+    base_model = model_name.replace("+cal", "")
+    params = list(params)
+    if not params:
+        return params
+    if base_model in {"log", "linear_fallback"}:
+        return [float(p) * scale for p in params]
+    if base_model == "power":
+        scaled = params.copy()
+        scaled[0] = float(scaled[0]) * scale
+        return scaled
+    return params
+
+
+def _prepare_impression_share_frame(df: pd.DataFrame) -> pd.DataFrame | None:
+    required = {
+        "search_impression_share",
+        "search_budget_lost_impression_share",
+        "search_rank_lost_impression_share",
+        "impressions",
+    }
+    if not required.issubset(df.columns):
+        return None
+
+    date_col = next((c for c in ("date", "week_start", "week") if c in df.columns), None)
+    if not date_col:
+        return None
+
+    rows = df.copy()
+    rows[date_col] = pd.to_datetime(rows[date_col], errors="coerce")
+    rows = rows.dropna(subset=[date_col])
+    rows["_date"] = rows[date_col]
+    rows["_month"] = rows["_date"].dt.to_period("M")
+    for col in [
+        "cost",
+        "conversion_value",
+        "impressions",
+        "eligible_search_impressions",
+        "search_impression_share",
+        "search_budget_lost_impression_share",
+        "search_rank_lost_impression_share",
+    ]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    return rows
+
+
+def _latest_complete_months(rows: pd.DataFrame, months: int = 3) -> list[pd.Period]:
+    available = sorted(rows["_month"].dropna().unique())
+    if not available:
+        return []
+    latest_date = rows["_date"].max().normalize()
+    latest_month = latest_date.to_period("M")
+    if latest_date.date() < latest_month.to_timestamp(how="end").date():
+        available = [month for month in available if month != latest_month]
+    return available[-months:]
+
+
+def _impression_share_summary(rows: pd.DataFrame, months: list[pd.Period]) -> pd.DataFrame:
+    subset = rows[rows["_month"].isin(months)].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    if "eligible_search_impressions" not in subset.columns:
+        valid_is = (
+            subset["search_impression_share"].notna()
+            & (subset["search_impression_share"] > 0)
+            & (subset["impressions"] > 0)
+        )
+        subset["eligible_search_impressions"] = np.where(
+            valid_is,
+            subset["impressions"] / subset["search_impression_share"],
+            np.nan,
+        )
+
+    subset["_budget_lost_weighted"] = (
+        subset["search_budget_lost_impression_share"] * subset["eligible_search_impressions"]
+    )
+    subset["_rank_lost_weighted"] = (
+        subset["search_rank_lost_impression_share"] * subset["eligible_search_impressions"]
+    )
+    summary = (
+        subset.groupby("account_name")
+        .agg(
+            spend=("cost", "sum"),
+            impressions=("impressions", "sum"),
+            eligible_search_impressions=("eligible_search_impressions", "sum"),
+            budget_lost_weighted=("_budget_lost_weighted", "sum"),
+            rank_lost_weighted=("_rank_lost_weighted", "sum"),
+        )
+        .reset_index()
+    )
+    eligible = summary["eligible_search_impressions"].where(
+        summary["eligible_search_impressions"] > 0
+    )
+    summary["search_impression_share"] = summary["impressions"] / eligible
+    summary["search_budget_lost_impression_share"] = summary["budget_lost_weighted"] / eligible
+    summary["search_rank_lost_impression_share"] = summary["rank_lost_weighted"] / eligible
+    return summary
+
+
+def _append_impression_share_warnings(scenario_set, df: pd.DataFrame) -> None:
+    rows = _prepare_impression_share_frame(df)
+    if rows is None:
+        return
+
+    months = _latest_complete_months(rows, months=3)
+    summary = _impression_share_summary(rows, months)
+    if summary.empty:
+        return
+
+    by_account = summary.set_index("account_name").to_dict("index")
+    scenarios = scenario_set.scenarios
+    scen_c = scenarios[2]
+    scen_d = scenarios[3] if len(scenarios) > 3 else None
+    c_allocs = {alloc.account: alloc for alloc in scen_c.allocations}
+
+    added_c = set()
+    for alloc in scen_c.allocations:
+        metrics = by_account.get(alloc.account)
+        if not metrics:
+            continue
+        lost_rank = metrics.get("search_rank_lost_impression_share", np.nan)
+        lost_budget = metrics.get("search_budget_lost_impression_share", np.nan)
+        if pd.notna(lost_rank) and lost_rank >= 0.40 and alloc.change_vs_prev > 0:
+            scen_c.warnings.append(
+                f"{alloc.account}: high lost rank IS ({lost_rank:.0%}); "
+                "budget increase may need bid, quality, or competitiveness work."
+            )
+            added_c.add(alloc.account)
+        elif pd.notna(lost_budget) and lost_budget >= 0.20 and alloc.change_vs_prev > 0:
+            scen_c.warnings.append(
+                f"{alloc.account}: high lost budget IS ({lost_budget:.0%}); "
+                "extra budget has clearer delivery headroom."
+            )
+            added_c.add(alloc.account)
+
+    if scen_d:
+        for alloc in scen_d.allocations:
+            metrics = by_account.get(alloc.account)
+            c_alloc = c_allocs.get(alloc.account)
+            if not metrics or not c_alloc:
+                continue
+            lost_rank = metrics.get("search_rank_lost_impression_share", np.nan)
+            if (
+                pd.notna(lost_rank)
+                and lost_rank >= 0.40
+                and alloc.monthly_spend > c_alloc.monthly_spend * 1.05
+            ):
+                scen_d.warnings.append(
+                    f"{alloc.account}: Scenario D scale-up is rank-constrained "
+                    f"(lost rank IS {lost_rank:.0%}); treat headroom as theoretical."
+                )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -64,10 +222,17 @@ def main():
                         help='Months of history to use for curve fitting (default: 6). '
                              'Use 0 to fit on the full input history.')
     parser.add_argument('--no-calibrate', action='store_true',
-                        help='Skip calibrating response curves to the actual lag-adjusted '
-                             'ROAS from the trailing 30-day window. By default curves are '
-                             'anchored so the predicted ROAS at current spend matches '
-                             'observed performance.')
+                        help='Skip calibrating response curves to recent lag-adjusted ROAS.')
+    parser.add_argument('--calibration-days', type=int, default=14,
+                        help='Trailing days used for calibration (default: 14; backtested best candidate).')
+    parser.add_argument('--calibration-blend', type=float, default=0.25,
+                        help='Calibration strength from 0 to 1 (default: 0.25; backtested best candidate).')
+    parser.add_argument('--calibration-min', type=float, default=0.7,
+                        help='Lower cap for account calibration factor (default: 0.7).')
+    parser.add_argument('--calibration-max', type=float, default=1.3,
+                        help='Upper cap for account calibration factor (default: 1.3).')
+    parser.add_argument('--confidence-iterations', type=int, default=200,
+                        help='Bootstrap iterations for Excel confidence intervals (0 disables; default: 200).')
 
     # Phase 2: Scenario generation
     parser.add_argument('--scenarios', dest='scenarios', action='store_true', default=True,
@@ -91,6 +256,16 @@ def main():
                         help='Disable stability rules (equivalent to --max-account-changes 0)')
 
     args = parser.parse_args()
+    if not 0 <= args.calibration_blend <= 1:
+        parser.error('--calibration-blend must be between 0 and 1')
+    if args.calibration_days <= 0:
+        parser.error('--calibration-days must be greater than 0')
+    if args.calibration_min <= 0 or args.calibration_max <= 0:
+        parser.error('--calibration-min and --calibration-max must be greater than 0')
+    if args.calibration_min > args.calibration_max:
+        parser.error('--calibration-min cannot exceed --calibration-max')
+    if args.confidence_iterations < 0:
+        parser.error('--confidence-iterations must be >= 0')
 
     # Ensure output directory exists
     Path('output').mkdir(exist_ok=True)
@@ -243,14 +418,14 @@ def main():
 
     print()
 
-    # ── Current spend + actual ROAS (trailing 30-day window = actual baseline) ──
+    # ── Current spend + actual ROAS (calibration window = actual baseline) ──
     date_col = next((c for c in ('date', 'week_start', 'week') if c in df.columns), None)
     actual_window_label = 'full input range'
     actual_window_detail = actual_window_label
     if date_col:
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
         latest_date = df[date_col].max().normalize()
-        cutoff = latest_date - pd.Timedelta(days=TRAILING_WINDOW_DAYS - 1)
+        cutoff = latest_date - pd.Timedelta(days=args.calibration_days - 1)
         recent = df[(df[date_col] >= cutoff) & (df[date_col] <= latest_date)]
         current_alloc      = recent.groupby('account_name')['cost'].sum().to_dict()
         actual_rev_30d     = recent.groupby('account_name')['conversion_value'].sum().to_dict()
@@ -259,7 +434,7 @@ def main():
             actual_rev_30d_raw = recent.groupby('account_name')['conversion_value_raw'].sum().to_dict()
         else:
             actual_rev_30d_raw = actual_rev_30d
-        actual_window_label = f'30d ending {latest_date.date()}'
+        actual_window_label = f'{args.calibration_days}d ending {latest_date.date()}'
         actual_window_detail = f'{cutoff.date()} to {latest_date.date()}'
     else:
         current_alloc      = df.groupby('account_name')['cost'].sum().to_dict()
@@ -277,13 +452,17 @@ def main():
         for acc in current_alloc if current_alloc[acc] > 0
     }
 
-    # ── Calibrate curves to actual lag-adjusted ROAS ─────────
-    # The fitted curve predicts revenue at current spend. We scale it so
-    # the prediction at current spend exactly matches the observed lag-adj ROAS.
-    # This anchors the absolute level to reality while preserving the curve shape
-    # (diminishing returns slope) derived from historical spend variation.
+    # ── Calibrate curves to recent lag-adjusted ROAS ─────────
+    # Backtests favored a conservative partial calibration:
+    # 14-day window, 25% blend toward observed ROAS, capped to 0.7x-1.3x.
+    # The same scale is applied to model params so mROAS/breakeven math follows.
     calibration_factors = {}
     if not args.no_calibrate:
+        print(
+            f'Calibration: {args.calibration_days}d window, '
+            f'blend={args.calibration_blend:.2f}, '
+            f'cap={args.calibration_min:.2f}x-{args.calibration_max:.2f}x'
+        )
         for acc in list(predict_fns):
             curr_sp  = current_alloc.get(acc, 0)
             adj_roas = actual_roas.get(acc, 0)
@@ -291,12 +470,15 @@ def main():
                 model_pred = predict_fns[acc](curr_sp)
                 model_roas = model_pred / curr_sp
                 if model_roas > 0:
-                    scale = adj_roas / model_roas
+                    raw_scale = adj_roas / model_roas
+                    capped_scale = min(max(raw_scale, args.calibration_min), args.calibration_max)
+                    scale = 1.0 + args.calibration_blend * (capped_scale - 1.0)
                     calibration_factors[acc] = scale
                     predict_fns[acc] = (lambda x, fn=predict_fns[acc], s=scale: fn(x) * s)
                     # Update model name in model_info to flag calibration
                     fn_i, params_i, r2_i, mname_i = model_info[acc]
-                    model_info[acc] = (fn_i, params_i, r2_i, f'{mname_i}+cal')
+                    model_info[acc] = (fn_i, _scaled_params(params_i, mname_i, scale), r2_i, f'{mname_i}+cal')
+        print()
 
     # ── Print per-market spend + ROAS table ──────────────────
     cal_label = '' if args.no_calibrate else '  cal.factor'
@@ -389,6 +571,7 @@ def main():
             wow_cap=args.wow_cap,
             apply_stability=args.apply_stability
         )
+        _append_impression_share_warnings(scenario_set, df)
 
         scenarios = scenario_set.scenarios
 
@@ -434,6 +617,42 @@ def main():
         print()
 
     # ── Build Excel report ───────────────────────────────────
+    confidence_payload = None
+    if args.scenarios and args.confidence_iterations > 0:
+        print(
+            f'Running bootstrap confidence intervals '
+            f'({args.confidence_iterations} iterations)...'
+        )
+        portfolio_ci, account_ci, confidence_metadata = run_bootstrap(
+            df=df,
+            date_col=date_col,
+            budget=args.budget,
+            iterations=args.confidence_iterations,
+            seed=42,
+            training_months=args.training_months,
+            outlier_removal=not args.no_outlier_removal,
+            calibrate=not args.no_calibrate,
+            calibration_days=args.calibration_days,
+            calibration_blend=args.calibration_blend,
+            calibration_min=args.calibration_min,
+            calibration_max=args.calibration_max,
+            min_mroas=args.min_mroas,
+            baseline_window=args.baseline_window,
+            max_account_changes=args.max_account_changes,
+            wow_cap=args.wow_cap,
+            apply_stability=args.apply_stability,
+        )
+        confidence_payload = {
+            'portfolio': portfolio_ci,
+            'accounts': account_ci,
+            'metadata': confidence_metadata,
+        }
+        print(
+            f'  Successful samples: {confidence_metadata["successful_iterations"]}  '
+            f'Failed: {len(confidence_metadata["failures"])}'
+        )
+        print()
+
     print(f'Building Excel report → {output_path}')
     if args.scenarios:
         # Multi-scenario Excel (Phase 6)
@@ -450,6 +669,9 @@ def main():
             forecast_label=forecast_label,
             actual_window_label=actual_window_label,
             actual_window_detail=actual_window_detail,
+            confidence_payload=confidence_payload,
+            calibration_factors=calibration_factors,
+            training_months=args.training_months,
         )
     else:
         # Old single-scenario mode (backward compat) - TODO: remove or map to minimal ScenarioSet

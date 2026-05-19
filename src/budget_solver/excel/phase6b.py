@@ -2,12 +2,436 @@
 Phase 6b supplementary sheets: Extended Budget, Curve Diagnostics, Outlier Log, Demand Index.
 """
 import numpy as np
+import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import LineChart, Reference, marker
 
 from budget_solver.constants import NAV, BLUE, GRN, RED, LBLU, WHIT, WEEKS_PER_MONTH
 from budget_solver.excel.styling import _hdr, _fmt_col, _border
 from budget_solver.solver import optimize_budget
+from budget_solver.confidence import portfolio_summary, recommended_account_summary
+
+
+def _diagnostic_df(df):
+    date_col = next((c for c in ('date', 'week_start', 'week') if c in df.columns), None)
+    if not date_col:
+        return pd.DataFrame()
+
+    rows = df.copy()
+    rows[date_col] = pd.to_datetime(rows[date_col], errors='coerce')
+    rows = rows.dropna(subset=[date_col])
+    rows['_date'] = rows[date_col]
+    rows['_month'] = rows['_date'].dt.to_period('M')
+    for col in [
+        'cost',
+        'conversion_value',
+        'clicks',
+        'impressions',
+        'conversions',
+        'conversions_adj',
+        'eligible_search_impressions',
+        'search_impression_share',
+        'search_budget_lost_impression_share',
+        'search_rank_lost_impression_share',
+    ]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors='coerce')
+    return rows
+
+
+def _complete_months(rows):
+    months = sorted(rows['_month'].dropna().unique())
+    if not months:
+        return []
+    latest_date = rows['_date'].max().normalize()
+    latest_month = latest_date.to_period('M')
+    if latest_date.date() < latest_month.to_timestamp(how='end').date():
+        months = [month for month in months if month != latest_month]
+    return months
+
+
+def _safe_div(num, den):
+    return num / den.replace(0, np.nan)
+
+
+def _write_table(ws, row, headers, records, formats=None):
+    formats = formats or {}
+    for c, header in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=c, value=header)
+        cell.font = Font(bold=True, size=9, name='Calibri', color=WHIT)
+        cell.fill = PatternFill('solid', fgColor=NAV)
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.border = _border()
+    row += 1
+
+    for i, record in enumerate(records):
+        fill = PatternFill('solid', fgColor=LBLU if i % 2 == 0 else WHIT)
+        for c, header in enumerate(headers, 1):
+            value = record.get(header)
+            cell = ws.cell(row=row, column=c, value=value)
+            if header in formats and isinstance(value, (int, float, np.floating)) and not pd.isna(value):
+                cell.number_format = formats[header]
+            cell.fill = fill
+            cell.border = _border()
+        row += 1
+    return row
+
+
+def _build_confidence_intervals(wb, confidence_payload, min_mroas):
+    ws = wb.create_sheet('Confidence Intervals')
+    ws.sheet_view.showGridLines = False
+
+    row = 1
+    ws.cell(row=row, column=1, value='CONFIDENCE INTERVALS - BOOTSTRAP RISK RANGES')
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14, name='Calibri', color=NAV)
+    row += 1
+
+    if not confidence_payload:
+        ws.cell(row=row, column=1, value='Confidence intervals were disabled for this run.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=9, name='Calibri', color='888888')
+        return
+
+    metadata = confidence_payload.get('metadata', {})
+    portfolio = confidence_payload.get('portfolio', pd.DataFrame())
+    accounts = confidence_payload.get('accounts', pd.DataFrame())
+    successful = metadata.get('successful_iterations', 0)
+    failures = len(metadata.get('failures', []))
+
+    ws.cell(row=row, column=1, value=(
+        f'Bootstrap samples: {successful} successful, {failures} failed. '
+        'Intervals are P10/P50/P90 across refitted scenario reruns.'
+    ))
+    ws.cell(row=row, column=1).font = Font(size=9, name='Calibri', color='888888')
+    row += 1
+    ws.cell(row=row, column=1, value=(
+        'Reliability Score is 0-100 and combines curve R², clean training weeks, '
+        'calibration stability, mROAS interval width, and probability below the floor.'
+    ))
+    ws.cell(row=row, column=1).font = Font(size=9, name='Calibri', color='888888')
+    row += 2
+
+    portfolio_ci = portfolio_summary(portfolio)
+    if not portfolio_ci.empty:
+        scenario_order = {'A': 0, 'B': 1, 'C': 2, 'C1': 2, 'D': 3}
+        portfolio_ci['_order'] = portfolio_ci['scenario_id'].map(scenario_order).fillna(99)
+        portfolio_ci = portfolio_ci.sort_values(['_order', 'scenario_id'])
+        records = []
+        for rec in portfolio_ci.to_dict('records'):
+            records.append({
+                'ID': rec.get('scenario_id'),
+                'Scenario': rec.get('scenario_name'),
+                'Budget Point': rec.get('budget_point'),
+                'Revenue Point': rec.get('revenue_point'),
+                'Revenue P10': rec.get('revenue_p10'),
+                'Revenue P50': rec.get('revenue_p50'),
+                'Revenue P90': rec.get('revenue_p90'),
+                'ROAS Point': rec.get('roas_point'),
+                'ROAS P10': rec.get('roas_p10'),
+                'ROAS P50': rec.get('roas_p50'),
+                'ROAS P90': rec.get('roas_p90'),
+            })
+        ws.cell(row=row, column=1, value='Portfolio Scenario Ranges')
+        ws.cell(row=row, column=1).font = Font(bold=True, size=11, name='Calibri', color=NAV)
+        row += 1
+        row = _write_table(
+            ws,
+            row,
+            ['ID', 'Scenario', 'Budget Point', 'Revenue Point', 'Revenue P10', 'Revenue P50',
+             'Revenue P90', 'ROAS Point', 'ROAS P10', 'ROAS P50', 'ROAS P90'],
+            records,
+            {
+                'Budget Point': '€#,##0',
+                'Revenue Point': '€#,##0',
+                'Revenue P10': '€#,##0',
+                'Revenue P50': '€#,##0',
+                'Revenue P90': '€#,##0',
+                'ROAS Point': '0.00"x"',
+                'ROAS P10': '0.00"x"',
+                'ROAS P50': '0.00"x"',
+                'ROAS P90': '0.00"x"',
+            },
+        )
+        row += 2
+
+    account_ci = recommended_account_summary(
+        accounts,
+        min_mroas,
+        metadata.get('account_quality'),
+    )
+    if not account_ci.empty:
+        account_ci = account_ci.sort_values(
+            ['reliability_score', 'prob_mroas_below_floor', 'spend_point'],
+            ascending=[True, False, False],
+            na_position='last',
+        )
+        records = []
+        for rec in account_ci.to_dict('records'):
+            records.append({
+                'Account': rec.get('account'),
+                'Reliability Score': rec.get('reliability_score'),
+                'Reliability Band': rec.get('reliability_band'),
+                'Scenario': rec.get('scenario_id_point'),
+                'Spend Point': rec.get('spend_point'),
+                'Spend P10': rec.get('spend_p10'),
+                'Spend P50': rec.get('spend_p50'),
+                'Spend P90': rec.get('spend_p90'),
+                'mROAS Point': rec.get('inst_mroas_point'),
+                'mROAS P10': rec.get('inst_mroas_p10'),
+                'mROAS P50': rec.get('inst_mroas_p50'),
+                'mROAS P90': rec.get('inst_mroas_p90'),
+                'Prob Below Floor': rec.get('prob_mroas_below_floor'),
+                'R2': rec.get('r2'),
+                'Clean Weeks': rec.get('clean_training_weeks'),
+                'Cal Factor': rec.get('calibration_factor'),
+                'CI Width %': rec.get('mroas_interval_width_pct'),
+            })
+        ws.cell(row=row, column=1, value=f'Recommended Scenario Account Risk (floor {min_mroas:.1f}x)')
+        ws.cell(row=row, column=1).font = Font(bold=True, size=11, name='Calibri', color=NAV)
+        row += 1
+        _write_table(
+            ws,
+            row,
+            ['Account', 'Reliability Score', 'Reliability Band', 'Scenario',
+             'Spend Point', 'Spend P10', 'Spend P50', 'Spend P90',
+             'mROAS Point', 'mROAS P10', 'mROAS P50', 'mROAS P90',
+             'Prob Below Floor', 'R2', 'Clean Weeks', 'Cal Factor', 'CI Width %'],
+            records,
+            {
+                'Reliability Score': '0',
+                'Spend Point': '€#,##0',
+                'Spend P10': '€#,##0',
+                'Spend P50': '€#,##0',
+                'Spend P90': '€#,##0',
+                'mROAS Point': '0.00"x"',
+                'mROAS P10': '0.00"x"',
+                'mROAS P50': '0.00"x"',
+                'mROAS P90': '0.00"x"',
+                'Prob Below Floor': '0.0%',
+                'R2': '0.00',
+                'Clean Weeks': '0',
+                'Cal Factor': '0.00"x"',
+                'CI Width %': '0.0%',
+            },
+        )
+
+    widths = [12, 18, 14, 12, 16, 16, 16, 16, 14, 14, 14, 14, 16, 10, 12, 12, 12]
+    for c, width in enumerate(widths, 1):
+        _fmt_col(ws, c, width)
+
+
+def _build_cpc_diagnostics(wb, df, months=3):
+    ws = wb.create_sheet('CPC Diagnostics')
+    ws.sheet_view.showGridLines = False
+
+    row = 1
+    ws.cell(row=row, column=1, value='CPC & CLICK EFFICIENCY DIAGNOSTICS')
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14, name='Calibri', color=NAV)
+    row += 1
+
+    rows = _diagnostic_df(df)
+    if rows.empty or 'clicks' not in rows.columns:
+        ws.cell(row=row, column=1, value='CPC diagnostics require dated rows with clicks.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=9, name='Calibri', color='888888')
+        return
+
+    complete = _complete_months(rows)
+    if len(complete) < months:
+        ws.cell(row=row, column=1, value='Not enough complete months for CPC diagnostics.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=9, name='Calibri', color='888888')
+        return
+
+    current_months = complete[-months:]
+    previous_months = [month - 12 for month in current_months]
+    available = set(complete)
+    previous_months = [month for month in previous_months if month in available]
+    if not previous_months:
+        previous_months = complete[-(months * 2):-months]
+    label = f'{current_months[0]} to {current_months[-1]}'
+    comp_label = f'{previous_months[0]} to {previous_months[-1]}' if previous_months else 'n/a'
+    ws.cell(row=row, column=1, value=f'Latest complete {months} months vs comparison period: {label} vs {comp_label}.')
+    ws.cell(row=row, column=1).font = Font(size=9, name='Calibri', color='888888')
+    row += 2
+
+    conv_col = 'conversions_adj' if 'conversions_adj' in rows.columns else 'conversions'
+    if conv_col not in rows.columns:
+        rows[conv_col] = np.nan
+
+    def summarize(month_list):
+        subset = rows[rows['_month'].isin(month_list)]
+        summary = (
+            subset.groupby('account_name')
+            .agg(
+                spend=('cost', 'sum'),
+                revenue=('conversion_value', 'sum'),
+                clicks=('clicks', 'sum'),
+                conversions=(conv_col, 'sum'),
+            )
+            .reset_index()
+        )
+        total = pd.DataFrame([{
+            'account_name': 'TOTAL',
+            'spend': summary['spend'].sum(),
+            'revenue': summary['revenue'].sum(),
+            'clicks': summary['clicks'].sum(),
+            'conversions': summary['conversions'].sum(),
+        }])
+        summary = pd.concat([summary, total], ignore_index=True)
+        summary['cpc'] = summary['spend'] / summary['clicks'].replace(0, np.nan)
+        summary['clicks_per_eur'] = summary['clicks'] / summary['spend'].replace(0, np.nan)
+        summary['cvr'] = summary['conversions'] / summary['clicks'].replace(0, np.nan)
+        summary['revenue_per_click'] = summary['revenue'] / summary['clicks'].replace(0, np.nan)
+        summary['roas'] = summary['revenue'] / summary['spend'].replace(0, np.nan)
+        return summary
+
+    current = summarize(current_months)
+    previous = summarize(previous_months) if previous_months else pd.DataFrame()
+    records = []
+    if not previous.empty:
+        merged = current.merge(previous, on='account_name', suffixes=('_cur', '_prev'))
+        for rec in merged.sort_values('spend_cur', ascending=False).to_dict('records'):
+            records.append({
+                'Account': rec['account_name'],
+                'Spend': rec['spend_cur'],
+                'CPC': rec['cpc_cur'],
+                'CPC Change': (rec['cpc_cur'] - rec['cpc_prev']) / rec['cpc_prev'] if rec['cpc_prev'] else np.nan,
+                'Clicks/EUR Change': (rec['clicks_per_eur_cur'] - rec['clicks_per_eur_prev']) / rec['clicks_per_eur_prev'] if rec['clicks_per_eur_prev'] else np.nan,
+                'CVR Change': (rec['cvr_cur'] - rec['cvr_prev']) / rec['cvr_prev'] if rec['cvr_prev'] else np.nan,
+                'Rev/Click Change': (rec['revenue_per_click_cur'] - rec['revenue_per_click_prev']) / rec['revenue_per_click_prev'] if rec['revenue_per_click_prev'] else np.nan,
+                'ROAS Change': (rec['roas_cur'] - rec['roas_prev']) / rec['roas_prev'] if rec['roas_prev'] else np.nan,
+            })
+
+    _write_table(
+        ws,
+        row,
+        ['Account', 'Spend', 'CPC', 'CPC Change', 'Clicks/EUR Change',
+         'CVR Change', 'Rev/Click Change', 'ROAS Change'],
+        records,
+        {
+            'Spend': '€#,##0',
+            'CPC': '€0.00',
+            'CPC Change': '+0.0%;-0.0%;0.0%',
+            'Clicks/EUR Change': '+0.0%;-0.0%;0.0%',
+            'CVR Change': '+0.0%;-0.0%;0.0%',
+            'Rev/Click Change': '+0.0%;-0.0%;0.0%',
+            'ROAS Change': '+0.0%;-0.0%;0.0%',
+        },
+    )
+    for c, width in enumerate([24, 14, 12, 14, 18, 14, 18, 14], 1):
+        _fmt_col(ws, c, width)
+
+
+def _build_impression_share_diagnostics(wb, df, months=3):
+    ws = wb.create_sheet('Impression Share')
+    ws.sheet_view.showGridLines = False
+
+    row = 1
+    ws.cell(row=row, column=1, value='SEARCH IMPRESSION SHARE DIAGNOSTICS')
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14, name='Calibri', color=NAV)
+    row += 1
+
+    rows = _diagnostic_df(df)
+    required = {
+        'search_impression_share',
+        'search_budget_lost_impression_share',
+        'search_rank_lost_impression_share',
+        'impressions',
+    }
+    if rows.empty or not required.issubset(rows.columns):
+        ws.cell(row=row, column=1, value='Impression share diagnostics require a fresh data pull with Search IS fields.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=9, name='Calibri', color='888888')
+        return
+
+    complete = _complete_months(rows)
+    current_months = complete[-months:] if len(complete) >= months else complete
+    if not current_months:
+        ws.cell(row=row, column=1, value='Not enough complete months for impression share diagnostics.')
+        ws.cell(row=row, column=1).font = Font(italic=True, size=9, name='Calibri', color='888888')
+        return
+
+    ws.cell(row=row, column=1, value=f'Weighted by eligible search impressions. Period: {current_months[0]} to {current_months[-1]}.')
+    ws.cell(row=row, column=1).font = Font(size=9, name='Calibri', color='888888')
+    row += 2
+
+    subset = rows[rows['_month'].isin(current_months)].copy()
+    if 'eligible_search_impressions' not in subset.columns:
+        valid_is = (
+            subset['search_impression_share'].notna()
+            & (subset['search_impression_share'] > 0)
+            & (subset['impressions'] > 0)
+        )
+        subset['eligible_search_impressions'] = np.where(
+            valid_is,
+            subset['impressions'] / subset['search_impression_share'],
+            np.nan,
+        )
+    subset['_budget_lost_weighted'] = (
+        subset['search_budget_lost_impression_share'] * subset['eligible_search_impressions']
+    )
+    subset['_rank_lost_weighted'] = (
+        subset['search_rank_lost_impression_share'] * subset['eligible_search_impressions']
+    )
+    summary = (
+        subset.groupby('account_name')
+        .agg(
+            spend=('cost', 'sum'),
+            revenue=('conversion_value', 'sum'),
+            impressions=('impressions', 'sum'),
+            eligible_search_impressions=('eligible_search_impressions', 'sum'),
+            budget_lost_weighted=('_budget_lost_weighted', 'sum'),
+            rank_lost_weighted=('_rank_lost_weighted', 'sum'),
+        )
+        .reset_index()
+    )
+    total = pd.DataFrame([{
+        'account_name': 'TOTAL',
+        'spend': summary['spend'].sum(),
+        'revenue': summary['revenue'].sum(),
+        'impressions': summary['impressions'].sum(),
+        'eligible_search_impressions': summary['eligible_search_impressions'].sum(),
+        'budget_lost_weighted': summary['budget_lost_weighted'].sum(),
+        'rank_lost_weighted': summary['rank_lost_weighted'].sum(),
+    }])
+    summary = pd.concat([summary, total], ignore_index=True)
+    eligible = summary['eligible_search_impressions'].where(summary['eligible_search_impressions'] > 0)
+    summary['search_is'] = summary['impressions'] / eligible
+    summary['lost_budget_is'] = summary['budget_lost_weighted'] / eligible
+    summary['lost_rank_is'] = summary['rank_lost_weighted'] / eligible
+    summary['roas'] = summary['revenue'] / summary['spend'].replace(0, np.nan)
+
+    records = []
+    for rec in summary.sort_values('spend', ascending=False).to_dict('records'):
+        flags = []
+        if pd.notna(rec['lost_budget_is']) and rec['lost_budget_is'] >= 0.10:
+            flags.append('budget constrained')
+        if pd.notna(rec['lost_rank_is']) and rec['lost_rank_is'] >= 0.20:
+            flags.append('rank constrained')
+        if pd.notna(rec['search_is']) and rec['search_is'] < 0.50:
+            flags.append('low Search IS')
+        records.append({
+            'Account': rec['account_name'],
+            'Spend': rec['spend'],
+            'Search IS': rec['search_is'],
+            'Lost Budget IS': rec['lost_budget_is'],
+            'Lost Rank IS': rec['lost_rank_is'],
+            'ROAS': rec['roas'],
+            'Flags': ', '.join(flags) if flags else 'ok',
+        })
+
+    _write_table(
+        ws,
+        row,
+        ['Account', 'Spend', 'Search IS', 'Lost Budget IS', 'Lost Rank IS', 'ROAS', 'Flags'],
+        records,
+        {
+            'Spend': '€#,##0',
+            'Search IS': '0.0%',
+            'Lost Budget IS': '0.0%',
+            'Lost Rank IS': '0.0%',
+            'ROAS': '0.00"x"',
+        },
+    )
+    for c, width in enumerate([24, 14, 14, 18, 16, 10, 48], 1):
+        _fmt_col(ws, c, width)
 
 
 def _build_extended_budget(wb, scenario_set, steps=6):
@@ -221,7 +645,7 @@ def _build_extended_budget(wb, scenario_set, steps=6):
     ws.column_dimensions['F'].width = 16
 
 
-def _build_curve_diagnostics(wb, scenario_set, model_info, account_data):
+def _build_curve_diagnostics(wb, scenario_set, model_info, account_data, calibration_factors=None, training_months=None):
     """
     Build Curve Diagnostics sheet — per-account R², training window, breakeven, mini charts.
 
@@ -276,11 +700,9 @@ def _build_curve_diagnostics(wb, scenario_set, model_info, account_data):
         n_points = len(data['spend'])
         avg_spend = float(np.mean(data['spend']))
 
-        # Calibration factor (assumed 1.0 if not stored - would need to extract from scenario generation)
-        cal_factor = 1.0  # TODO: extract from scenario_set if available
+        cal_factor = (calibration_factors or {}).get(account, 1.0)
 
-        # Training window (assumed 6 months if not stored)
-        training_window = '6 months'  # TODO: extract from scenario_set if available
+        training_window = f'{training_months} months' if training_months else 'full history'
 
         fill = PatternFill('solid', fgColor=LBLU if i % 2 == 0 else WHIT)
 
